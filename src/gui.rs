@@ -265,6 +265,7 @@ pub struct Messenger95App {
     system_grounded: String,
     temperature: f32,
     max_tokens: u32,
+    num_ctx: u32,
     timeout_seconds: u64,
     use_factory_data: bool,
     input: String,
@@ -319,6 +320,7 @@ impl Messenger95App {
             system_grounded,
             temperature: config.temperature,
             max_tokens: config.max_tokens,
+            num_ctx: config.num_ctx.unwrap_or(0),
             timeout_seconds: config.timeout_seconds,
             use_factory_data: false,
             input: String::new(),
@@ -340,6 +342,42 @@ impl Messenger95App {
 
     fn is_gpt_oss_selected(&self) -> bool {
         self.model == GPT_OSS_MODEL
+    }
+
+    fn gpt_oss_min_predict_for_level(level: ReasoningLevel) -> u32 {
+        match level {
+            ReasoningLevel::Low => 2048,
+            ReasoningLevel::Medium => 4096,
+            ReasoningLevel::High => 8192,
+        }
+    }
+
+    fn gpt_oss_min_ctx_for_level(level: ReasoningLevel) -> u32 {
+        match level {
+            ReasoningLevel::Low => 8192,
+            ReasoningLevel::Medium => 16384,
+            ReasoningLevel::High => 32768,
+        }
+    }
+
+    fn compute_generation_budget(&self) -> (u32, Option<u32>) {
+        if !self.is_gpt_oss_selected() {
+            return (self.max_tokens, None);
+        }
+
+        let min_predict = Self::gpt_oss_min_predict_for_level(self.reasoning_level);
+        let mut num_predict = self.max_tokens.max(min_predict);
+        num_predict = num_predict.clamp(512, 16384);
+
+        let min_ctx = Self::gpt_oss_min_ctx_for_level(self.reasoning_level);
+        let mut num_ctx = if self.num_ctx == 0 {
+            min_ctx
+        } else {
+            self.num_ctx
+        };
+        num_ctx = num_ctx.max(num_predict.saturating_add(1024));
+
+        (num_predict, Some(num_ctx))
     }
 
     fn current_thinking_text(&self) -> &str {
@@ -380,11 +418,14 @@ impl Messenger95App {
             (prompt.clone(), 0)
         };
 
-        let system_prompt = if factory_mode {
+        let mut system_prompt = if factory_mode {
             self.system_grounded.clone()
         } else {
             self.system.clone()
         };
+        system_prompt.push_str(
+            "\n\nCONTRAINTES DE LANGUE:\n- Reponds exclusivement en francais.\n- Si une trace de raisonnement (thinking) est produite, elle doit aussi etre en francais.\n- Ne reponds jamais avec une reponse vide.",
+        );
 
         let messages_for_request = self.build_context_messages(&prompt_for_model, &system_prompt);
 
@@ -415,25 +456,22 @@ impl Messenger95App {
             include_in_context: true,
         });
         self.pending_assistant_index = Some(self.messages.len() - 1);
-        let effective_max_tokens = if gpt_oss_mode && self.reasoning_level == ReasoningLevel::High {
-            self.max_tokens.max(2048)
+        let (effective_max_tokens, effective_num_ctx) = self.compute_generation_budget();
+        let reasoning_effort = if gpt_oss_mode {
+            Some(self.reasoning_level.as_api_value().to_string())
         } else {
-            self.max_tokens
+            None
         };
 
         let config = ChatConfig {
             host: self.host.clone(),
             model: self.model.clone(),
-            system: self.system.clone(),
+            system: system_prompt,
             temperature: self.temperature,
             max_tokens: effective_max_tokens,
             timeout_seconds: self.timeout_seconds,
-            reasoning_effort: if gpt_oss_mode {
-                Some(self.reasoning_level.as_api_value().to_string())
-            } else {
-                None
-            },
-            num_ctx: if gpt_oss_mode { Some(2048) } else { None },
+            reasoning_effort,
+            num_ctx: effective_num_ctx,
             ..ChatConfig::default()
         };
 
@@ -447,6 +485,7 @@ impl Messenger95App {
 
             let result = match runtime {
                 Ok(rt) => rt.block_on(async {
+                    let base_config = config.clone();
                     let client = ChatClient::new(config)?;
                     let history = messages_for_request;
                     let mut streamed_any_content = false;
@@ -479,7 +518,7 @@ impl Messenger95App {
 
                     if recovery_reason.is_some() {
                         let response = client
-                            .oneshot_ollama_with_messages(history)
+                            .oneshot_ollama_with_messages(history.clone())
                             .await
                             .with_context(|| recovery_reason.unwrap_or_default())?;
                         if !response.thinking.is_empty() {
@@ -493,10 +532,56 @@ impl Messenger95App {
                     }
 
                     if !streamed_any_content && streamed_any_thinking {
-                        let _ = tx.send(WorkerEvent::Chunk(
-                            "Aucune reponse finale generee. Voir la chaine de pensee a droite."
+                        let mut final_config = base_config.clone();
+                        final_config.reasoning_effort = Some("low".to_string());
+                        final_config.max_tokens = final_config.max_tokens.max(4096);
+                        final_config.num_ctx = Some(final_config.num_ctx.unwrap_or(16384).max(16384));
+
+                        let mut final_messages = history.clone();
+                        final_messages.push(Message {
+                            role: "user".to_string(),
+                            content: "Donne maintenant la REPONSE FINALE (pas la chaine de pensee). \
+Reponds en francais, de maniere longue et structuree (titres + listes), \
+avec exemples concrets et code si pertinent. \
+Ne mentionne pas que c'est une seconde passe."
                                 .to_string(),
-                        ));
+                        });
+
+                        match ChatClient::new(final_config) {
+                            Ok(final_client) => {
+                                match final_client
+                                    .oneshot_ollama_with_messages(final_messages)
+                                    .await
+                                {
+                                    Ok(final_resp) => {
+                                        if !final_resp.content.trim().is_empty() {
+                                            let _ = tx.send(WorkerEvent::Chunk(final_resp.content));
+                                            streamed_any_content = true;
+                                        } else {
+                                            let _ = tx.send(WorkerEvent::Chunk(
+                                                "Le modele n'a toujours pas produit de reponse finale. Affichage de la chaine de pensee par defaut."
+                                                    .to_string(),
+                                            ));
+                                            streamed_any_content = true;
+                                        }
+                                    }
+                                    Err(err) => {
+                                        let _ = tx.send(WorkerEvent::Error(format!(
+                                            "Finalizer pass echoue: {err}"
+                                        )));
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                let _ = tx.send(WorkerEvent::Error(format!(
+                                    "Impossible de creer final_client: {err}"
+                                )));
+                            }
+                        }
+                    }
+
+                    if !streamed_any_content && !streamed_any_thinking {
+                        let _ = tx.send(WorkerEvent::Chunk("<reponse vide>".to_string()));
                     }
 
                     Ok::<(), anyhow::Error>(())
@@ -528,14 +613,6 @@ impl Messenger95App {
                 Ok(WorkerEvent::Chunk(chunk)) => self.append_assistant_chunk(&chunk),
                 Ok(WorkerEvent::Thinking(thinking)) => self.append_assistant_thinking(&thinking),
                 Ok(WorkerEvent::Done) => {
-                    if let Some(index) = self.pending_assistant_index {
-                        if let Some(line) = self.messages.get_mut(index) {
-                            if line.text.trim().is_empty() && !line.thinking.trim().is_empty() {
-                                line.text = "Aucune reponse finale generee. Voir la chaine de pensee a droite.".to_string();
-                                line.include_in_context = false;
-                            }
-                        }
-                    }
                     self.pending = false;
                     self.status = "Pret".to_string();
                     self.pending_assistant_index = None;
@@ -861,6 +938,30 @@ impl eframe::App for Messenger95App {
                                     });
                             });
                         });
+                        ui.horizontal(|ui| {
+                            ui.label("Max tokens:");
+                            sunken_panel(ui, WIN95_INPUT_BG, 3, |ui| {
+                                ui.add_sized(
+                                    [100.0, 24.0],
+                                    egui::DragValue::new(&mut self.max_tokens)
+                                        .range(256..=16384)
+                                        .speed(64),
+                                );
+                            });
+
+                            ui.add_space(10.0);
+
+                            ui.label("Contexte (num_ctx):");
+                            sunken_panel(ui, WIN95_INPUT_BG, 3, |ui| {
+                                ui.add_sized(
+                                    [110.0, 24.0],
+                                    egui::DragValue::new(&mut self.num_ctx)
+                                        .range(0..=131072)
+                                        .speed(256),
+                                );
+                            });
+                            ui.label(RichText::new("(0 = auto)").small());
+                        });
                         if self.is_gpt_oss_selected() {
                             ui.horizontal(|ui| {
                                 ui.label(RichText::new("Raisonnement:").strong());
@@ -1060,6 +1161,7 @@ mod tests {
             system_grounded: "system-grounded".to_string(),
             temperature: 0.2,
             max_tokens: 1024,
+            num_ctx: 0,
             timeout_seconds: 600,
             use_factory_data: false,
             input: String::new(),
@@ -1106,6 +1208,7 @@ mod tests {
             model: "qwen2.5-coder:14b".to_string(),
             temperature: 0.45,
             max_tokens: 1536,
+            num_ctx: Some(4096),
             timeout_seconds: 321,
             ..ChatConfig::default()
         };
@@ -1114,7 +1217,52 @@ mod tests {
 
         assert_eq!(app.temperature, 0.45);
         assert_eq!(app.max_tokens, 1536);
+        assert_eq!(app.num_ctx, 4096);
         assert_eq!(app.timeout_seconds, 321);
+    }
+
+    #[test]
+    fn compute_generation_budget_for_qwen_keeps_max_tokens_and_auto_ctx() {
+        let app = Messenger95App::new(ChatConfig {
+            model: "qwen2.5-coder:14b".to_string(),
+            max_tokens: 1337,
+            num_ctx: Some(9999),
+            ..ChatConfig::default()
+        });
+
+        let (predict, ctx) = app.compute_generation_budget();
+        assert_eq!(predict, 1337);
+        assert_eq!(ctx, None);
+    }
+
+    #[test]
+    fn compute_generation_budget_for_gpt_oss_enforces_reasoning_minimums() {
+        let mut app = Messenger95App::new(ChatConfig {
+            model: GPT_OSS_MODEL.to_string(),
+            max_tokens: 1024,
+            num_ctx: None,
+            ..ChatConfig::default()
+        });
+        app.reasoning_level = ReasoningLevel::High;
+
+        let (predict, ctx) = app.compute_generation_budget();
+        assert_eq!(predict, 8192);
+        assert_eq!(ctx, Some(32768));
+    }
+
+    #[test]
+    fn compute_generation_budget_for_gpt_oss_respects_ctx_override_with_headroom() {
+        let mut app = Messenger95App::new(ChatConfig {
+            model: GPT_OSS_MODEL.to_string(),
+            max_tokens: 5000,
+            num_ctx: Some(5200),
+            ..ChatConfig::default()
+        });
+        app.reasoning_level = ReasoningLevel::Medium;
+
+        let (predict, ctx) = app.compute_generation_budget();
+        assert_eq!(predict, 5000);
+        assert_eq!(ctx, Some(6024));
     }
 
     #[test]

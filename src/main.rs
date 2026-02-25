@@ -64,11 +64,7 @@ struct Args {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let cli_num_ctx = if args.model == "gpt-oss:20b" {
-        Some(2048)
-    } else {
-        None
-    };
+    let cli_num_ctx = None;
     let config = ChatConfig {
         host: args.host,
         model: args.model,

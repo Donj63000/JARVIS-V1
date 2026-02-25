@@ -13,6 +13,29 @@ L'objectif est simple: faire tourner une IA sur la machine locale, sans dependre
 
 Les donnees de conversation, le guide metier et l'inference restent en local (selon votre configuration Docker/Ollama).
 
+## Configuration minimale recommandee (ca marche, mais ca peut ramer)
+
+Ces valeurs sont des minimums pratiques pour lancer l'app avec les modeles du projet.
+En dessous, ca peut ne pas demarrer ou devenir tres lent (swap disque, reponses longues, freeze UI).
+
+- OS:
+  - Windows 10 22H2+ (ou Linux/macOS avec Docker/Ollama)
+- RAM systeme:
+  - minimum 16 GB pour `qwen2.5-coder:14b` ou `gpt-oss:20b`
+  - a 16 GB, attendez-vous a des ralentissements en prompts longs et en mode raisonnement `Haut`
+- GPU (optionnel mais conseille):
+  - minimum 12 GB VRAM pour `qwen2.5-coder:14b`
+  - minimum 16 GB VRAM pour `gpt-oss:20b`
+  - sans GPU, execution CPU possible mais plus lente
+- Stockage libre:
+  - minimum 25 GB si vous gardez un seul modele (app + Ollama + marge)
+  - minimum 40 GB si vous gardez `qwen2.5-coder:14b` et `gpt-oss:20b`
+
+Recommande pour un usage fluide:
+- 32 GB RAM
+- GPU 16 GB VRAM+
+- SSD NVMe
+
 ## Modeles utilises et credits (important)
 
 Ce projet utilise des modeles open-weight distribues via Ollama.
@@ -29,6 +52,11 @@ Nous ne revendiquons pas la propriete de ces modeles. Le credit revient integral
     - https://ollama.com/library/gpt-oss:20b
 
 Respectez toujours la licence et les conditions d'usage de chaque modele.
+
+Sources techniques (tailles/memoire):
+- https://ollama.com/library/qwen2.5-coder:14b
+- https://ollama.com/library/gpt-oss:20b
+- https://docs.ollama.com/windows
 
 ## Demarrage rapide (Ollama local via Docker)
 
@@ -51,6 +79,87 @@ Si `guide-production-rochias.txt` est present a la racine, le mode guide est act
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\stop-local-model.ps1
 ```
+
+## No dev (pas a pas Windows)
+
+Cette section explique comment utiliser le projet meme si vous n'etes pas developpeur.
+
+### 1) Installer les prerequis (une seule fois)
+
+- Git for Windows: https://git-scm.com/download/win
+- Rust (rustup): https://www.rust-lang.org/tools/install
+- Visual Studio Build Tools (C++): https://visualstudio.microsoft.com/fr/visual-cpp-build-tools/
+- Docker Desktop: https://www.docker.com/products/docker-desktop/
+
+Important:
+- Activez WSL2 dans Docker Desktop si demande.
+- Redemarrez le PC apres l'installation des outils si Windows le demande.
+
+### 2) Telecharger le projet
+
+Ouvrez PowerShell puis lancez:
+
+```powershell
+cd $HOME
+git clone https://github.com/Donj63000/JARVIS-V1.git
+cd .\JARVIS-V1
+```
+
+### 3) Telecharger un modele IA en local
+
+Exemple avec `qwen2.5-coder:14b`:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\start-local-model.ps1 -Model qwen2.5-coder:14b
+```
+
+Exemple avec `gpt-oss:20b`:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\start-local-model.ps1 -Model gpt-oss:20b
+```
+
+Notes:
+- Le premier telechargement peut etre long (plusieurs Go).
+- Les modeles ne sont pas dans ce repo: chacun les telecharge sur son PC.
+
+### 4) Compiler l'application
+
+```powershell
+cargo build --release
+```
+
+La premiere compilation peut prendre plusieurs minutes.
+
+### 5) Lancer le logiciel
+
+```powershell
+.\target\release\LocalAI.exe
+```
+
+Alternative:
+
+```powershell
+cargo run --release
+```
+
+### 6) Utiliser l'application
+
+- Verifier `Host`: `http://localhost:11434`
+- Choisir le modele dans le selecteur
+- Ecrire un message puis cliquer sur `Envoyer`
+
+### 7) Arreter le backend local quand vous avez fini
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\stop-local-model.ps1
+```
+
+### Depannage rapide
+
+- Erreur script PowerShell: lancez une fois `Set-ExecutionPolicy -Scope Process Bypass`
+- Erreur Docker/Ollama: verifiez que Docker Desktop est bien demarre
+- Reponse tres lente: prenez un modele plus leger ou baissez le niveau de raisonnement
 
 ## Mode CLI
 
