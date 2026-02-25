@@ -1,0 +1,9 @@
+/target
+/runtime
+target_ci/
+target_ci_gpt/
+.idea/
+plan.md
+agents.md
+AGENTS.md
+guide-production-rochias.txt
