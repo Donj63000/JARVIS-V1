@@ -1,110 +1,132 @@
 # JARVIS V1 (LocalAI)
 
-Local desktop chatbot in Rust with:
-- Windows 95 / MSN-like chat window (`eframe`/`egui`)
-- Local model backend via Ollama HTTP API
-- Grounded answers on the Rochias production guide (RAG-style retrieval)
-- Citation-first responses (`[section|Lx-Ly]`) and safe abstention when unknown
-- CLI fallback mode
-- Unit and integration tests
+Concept d'assistant IA 100% local en Rust:
+- interface desktop style Messenger 95 (`eframe`/`egui`)
+- backend local via API HTTP Ollama
+- mode guide (RAG) base sur `guide-production-rochias.txt`
+- mode conversation libre
+- tests unitaires et d'integration
 
-## Quick start (project-local Ollama via Docker)
+## Philosophie du projet
 
-1. Start Ollama in Docker and pull a model into the project volume:
+L'objectif est simple: faire tourner une IA sur la machine locale, sans dependre d'un service cloud pour les usages standards.
+
+Les donnees de conversation, le guide metier et l'inference restent en local (selon votre configuration Docker/Ollama).
+
+## Modeles utilises et credits (important)
+
+Ce projet utilise des modeles open-weight distribues via Ollama.
+Nous ne revendiquons pas la propriete de ces modeles. Le credit revient integralement a leurs createurs.
+
+- `qwen2.5-coder:14b`
+  - Createur: Qwen Team (Alibaba Cloud)
+  - Reference: https://huggingface.co/Qwen/Qwen2.5-Coder-14B-Instruct
+- `gpt-oss:20b`
+  - Createur: OpenAI
+  - References:
+    - https://openai.com/index/introducing-gpt-oss
+    - https://openai.com/index/gpt-oss-model-card
+    - https://ollama.com/library/gpt-oss:20b
+
+Respectez toujours la licence et les conditions d'usage de chaque modele.
+
+## Demarrage rapide (Ollama local via Docker)
+
+1. Demarrer Ollama et telecharger un modele dans le volume du projet:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\start-local-model.ps1 -Model qwen2.5-coder:14b
 ```
 
-2. Launch the GUI chat app:
+2. Lancer l'application GUI:
 
 ```powershell
 cargo run --release
 ```
 
-If `guide-production-rochias.txt` is present at project root, guide-grounded mode is enabled automatically.
+Si `guide-production-rochias.txt` est present a la racine, le mode guide est active automatiquement.
 
-3. Stop local Ollama service when done:
+3. Arreter Ollama local:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\stop-local-model.ps1
 ```
 
-## CLI mode
+## Mode CLI
 
-One-shot:
+Commande simple:
 
 ```powershell
-cargo run --release -- --cli "Explain Rust ownership in 4 bullets."
+cargo run --release -- --cli "Explique ownership en Rust en 4 points."
 ```
 
 Streaming:
 
 ```powershell
-cargo run --release -- --cli --stream "Write a Rust function that sorts Vec<i32>."
+cargo run --release -- --cli --stream "Ecris une fonction Rust qui trie un Vec<i32>."
 ```
 
-Grounded CLI with guide:
+CLI avec guide:
 
 ```powershell
 cargo run --release -- --cli --model qwen2.5-coder:14b --guide guide-production-rochias.txt "Quel signal est mentionne en cas de defaut ?"
 ```
 
-## Config options
+## Options de configuration
 
-All modes support:
-- `--host` (default `http://localhost:11434`)
-- `--model` (default `qwen2.5-coder:14b`)
+Disponibles en GUI/CLI:
+- `--host` (defaut `http://localhost:11434`)
+- `--model` (defaut `qwen2.5-coder:14b`)
 - `--system`
 - `--temperature`
 - `--max-tokens`
-- `--timeout-seconds` (default `600`)
-- `--guide` (default `guide-production-rochias.txt`)
-- `--no-guide` (disable grounded retrieval)
-- `--source-limit` (default `6`)
+- `--timeout-seconds` (defaut `600`)
+- `--guide` (defaut `guide-production-rochias.txt`)
+- `--no-guide` (desactive le RAG guide)
+- `--source-limit` (defaut `6`)
 
-## Guide-grounded behavior
+## Comportement du mode guide (RAG)
 
-- The app chunks and indexes the production guide.
-- Each question retrieves top relevant passages.
-- The model is prompted to answer only from these passages.
-- If evidence is missing, it must answer: `Information non trouvee dans le guide fourni.`
-- In GUI, model selector includes: `qwen2.5-coder:14b`, `gpt-oss:20b`.
-- When `gpt-oss:20b` is selected, a reasoning mode control appears (`Bas`, `Moyen`, `Haut`) and the right panel shows `Chaine de pensee`.
+- Le guide est segmente, indexe puis interroge.
+- Chaque question recupere les passages les plus pertinents.
+- Le modele est contraint a repondre uniquement avec ces passages.
+- Si aucune preuve n'est trouvee: `Information non trouvee dans le guide fourni.`
+- Dans l'UI, les modeles proposes sont `qwen2.5-coder:14b` et `gpt-oss:20b`.
+- Avec `gpt-oss:20b`, le choix du niveau de raisonnement (`Bas`, `Moyen`, `Haut`) est disponible et la `Chaine de pensee` est affichee a droite.
 
 ## Tests
 
-Run all tests:
+Tout lancer:
 
 ```powershell
 cargo test
 ```
 
-Run guide RAG evaluation against the local model:
+Evaluation guide RAG sur modele local:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\eval-guide-rag.ps1 -Model qwen2.5-coder:14b
 ```
 
-Quick smoke run:
+Smoke test rapide:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\eval-guide-rag.ps1 -Model qwen2.5-coder:14b -MaxQuestions 3
 ```
 
-What is tested:
-- NDJSON stream parsing
-- OpenAI-compatible response extraction
-- HTTP integration against mock server for both `/v1/chat/completions` and `/api/chat`
-- Guide retrieval quality on real guide facts (when file is present)
-- Guardrail/citation prompt structure
+Ce qui est teste:
+- parsing NDJSON streaming
+- extraction de reponses OpenAI-compatibles
+- integration HTTP mockee (`/v1/chat/completions` et `/api/chat`)
+- qualite de retrieval du guide (si le fichier existe)
+- structure des prompts (garde-fous/citations)
 
-## Project files
+## Fichiers principaux
 
-- `src/chat_api.rs`: backend client and parsers
-- `src/guide_knowledge.rs`: guide indexing, retrieval, grounding prompts
-- `src/gui.rs`: messenger-style GUI
-- `src/main.rs`: entrypoint (GUI default, CLI optional)
-- `docker-compose.yml`: local Ollama service
-- `scripts/start-local-model.ps1`: start service + pull model
-- `scripts/eval-guide-rag.ps1`: automated grounded-answer check
+- `src/chat_api.rs`: client backend + parseurs
+- `src/guide_knowledge.rs`: indexation/retrieval/grounding du guide
+- `src/gui.rs`: interface style messenger
+- `src/main.rs`: point d'entree (GUI par defaut, CLI possible)
+- `docker-compose.yml`: service Ollama local
+- `scripts/start-local-model.ps1`: demarrage + pull modele
+- `scripts/eval-guide-rag.ps1`: verification auto des reponses guidees
