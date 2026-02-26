@@ -23,9 +23,12 @@ const WIN95_WINDOW_BG: Color32 = Color32::from_rgb(236, 233, 216);
 const WIN95_INPUT_BG: Color32 = Color32::from_rgb(255, 255, 255);
 const USER_BUBBLE: Color32 = Color32::from_rgb(235, 244, 255);
 const ASSISTANT_BUBBLE: Color32 = Color32::from_rgb(255, 255, 228);
-const LOGO_COLUMN_WIDTH: f32 = 260.0;
-const HEADER_ROW_HEIGHT: f32 = 240.0;
-const LOGO_DISPLAY_SIZE: f32 = 220.0;
+const LOGO_SIZE_MIN: f32 = 86.0;
+const LOGO_SIZE_MAX: f32 = 128.0;
+const LOGO_COLUMN_MIN_WIDTH: f32 = 104.0;
+const LOGO_COLUMN_MAX_WIDTH: f32 = 156.0;
+const HEADER_ROW_HEIGHT_QWEN: f32 = 78.0;
+const HEADER_ROW_HEIGHT_GPT: f32 = 126.0;
 
 #[derive(Clone, Copy)]
 enum ChatRole {
@@ -45,6 +48,14 @@ enum WorkerEvent {
     Thinking(String),
     Done,
     Error(String),
+}
+
+#[derive(Clone, Copy)]
+struct HeaderLayout {
+    controls_col_width: f32,
+    logo_col_width: f32,
+    logo_size: f32,
+    row_height: f32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -251,10 +262,28 @@ fn sunken_panel<R>(
     panel
 }
 
-fn render_logo(ui: &mut egui::Ui) -> egui::Response {
+fn compute_header_layout(available_width: f32, gpt_oss_mode: bool) -> HeaderLayout {
+    let logo_size = (available_width * 0.10).clamp(LOGO_SIZE_MIN, LOGO_SIZE_MAX);
+    let logo_col_width = (logo_size + 16.0).clamp(LOGO_COLUMN_MIN_WIDTH, LOGO_COLUMN_MAX_WIDTH);
+    let controls_col_width = (available_width - logo_col_width - 6.0).max(240.0);
+    let row_height = if gpt_oss_mode {
+        HEADER_ROW_HEIGHT_GPT
+    } else {
+        HEADER_ROW_HEIGHT_QWEN
+    };
+
+    HeaderLayout {
+        controls_col_width,
+        logo_col_width,
+        logo_size,
+        row_height,
+    }
+}
+
+fn render_logo(ui: &mut egui::Ui, size: f32) -> egui::Response {
     ui.add(
         egui::Image::new(egui::include_image!("../images/logo1.png"))
-            .fit_to_exact_size(egui::vec2(LOGO_DISPLAY_SIZE, LOGO_DISPLAY_SIZE))
+            .fit_to_exact_size(egui::vec2(size, size))
             .texture_options(egui::TextureOptions::LINEAR),
     )
 }
@@ -267,11 +296,24 @@ fn is_connection_refused_error(err: &str) -> bool {
         || lower.contains("aucune connexion")
 }
 
+fn is_model_memory_error(err: &str) -> bool {
+    let lower = err.to_ascii_lowercase();
+    lower.contains("requires more system memory")
+        || lower.contains("not enough memory")
+        || lower.contains("insufficient memory")
+        || lower.contains("out of memory")
+}
+
 fn format_worker_error(err: &str, host: &str) -> String {
     if is_connection_refused_error(err) {
         return format!(
             "Connexion impossible a {host}.\nLe serveur Ollama ne repond pas (connexion refusee).\nLance-le puis reessaie:\npowershell -ExecutionPolicy Bypass -File .\\scripts\\start-local-model.ps1 -Model qwen2.5-coder:14b"
         );
+    }
+
+    if is_model_memory_error(err) {
+        return "Memoire insuffisante pour charger ce modele.\nActions recommandees:\n- Basculer sur un modele plus leger.\n- Fermer les applications lourdes (RAM libre).\n- Reduire num_ctx/max_tokens.\n\nDetail technique:\n".to_string()
+            + err;
     }
 
     format!("Erreur: {err}")
@@ -664,6 +706,8 @@ impl Messenger95App {
                     self.pending = false;
                     self.status = if is_connection_refused_error(&err) {
                         "Serveur hors ligne".to_string()
+                    } else if is_model_memory_error(&err) {
+                        "Memoire insuffisante".to_string()
                     } else {
                         "Erreur".to_string()
                     };
@@ -978,48 +1022,51 @@ impl eframe::App for Messenger95App {
                 raised_panel(ui, WIN95_FACE, 8, |ui| {
                     sunken_panel(ui, WIN95_FACE, 6, |ui| {
                         ui.horizontal(|ui| {
-                            let controls_col_width =
-                                (ui.available_width() - LOGO_COLUMN_WIDTH - 2.0).max(260.0);
+                            let gpt_oss_selected = self.is_gpt_oss_selected();
+                            let header_layout =
+                                compute_header_layout(ui.available_width(), gpt_oss_selected);
 
                             ui.allocate_ui_with_layout(
-                                egui::vec2(controls_col_width, HEADER_ROW_HEIGHT),
-                                Layout::left_to_right(Align::Center),
+                                egui::vec2(header_layout.controls_col_width, header_layout.row_height),
+                                Layout::top_down(Align::LEFT),
                                 |ui| {
-                                    let host_width = if self.is_gpt_oss_selected() {
-                                        126.0
+                                    let host_width = if gpt_oss_selected {
+                                        108.0
                                     } else {
-                                        170.0
+                                        146.0
                                     };
 
-                                    ui.label("Host:");
-                                    sunken_panel(ui, WIN95_INPUT_BG, 3, |ui| {
-                                        ui.add_sized(
-                                            [host_width, 24.0],
-                                            egui::TextEdit::singleline(&mut self.host),
-                                        );
-                                    });
-                                    ui.label("Modele:");
-                                    sunken_panel(ui, WIN95_INPUT_BG, 3, |ui| {
-                                        egui::ComboBox::from_id_salt("model_selector")
-                                            .width(140.0)
-                                            .selected_text(self.model.as_str())
-                                            .show_ui(ui, |ui| {
-                                                for option in MODEL_OPTIONS {
-                                                    ui.selectable_value(
-                                                        &mut self.model,
-                                                        option.to_string(),
-                                                        option,
-                                                    );
-                                                }
-                                            });
-                                    });
-
-                                    if self.is_gpt_oss_selected() {
-                                        ui.add_space(4.0);
-                                        ui.label(RichText::new("Raisonnement:").strong());
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.label("Host:");
                                         sunken_panel(ui, WIN95_INPUT_BG, 3, |ui| {
-                                            egui::ComboBox::from_id_salt("reasoning_level_selector")
-                                                .width(92.0)
+                                            ui.add_sized(
+                                                [host_width, 20.0],
+                                                egui::TextEdit::singleline(&mut self.host),
+                                            );
+                                        });
+                                        ui.label("Modele:");
+                                        sunken_panel(ui, WIN95_INPUT_BG, 3, |ui| {
+                                            egui::ComboBox::from_id_salt("model_selector")
+                                                .width(118.0)
+                                                .selected_text(self.model.as_str())
+                                                .show_ui(ui, |ui| {
+                                                    for option in MODEL_OPTIONS {
+                                                        ui.selectable_value(
+                                                            &mut self.model,
+                                                            option.to_string(),
+                                                            option,
+                                                        );
+                                                    }
+                                                });
+                                        });
+
+                                        if gpt_oss_selected {
+                                            ui.label("Raisonn.:");
+                                            sunken_panel(ui, WIN95_INPUT_BG, 3, |ui| {
+                                                egui::ComboBox::from_id_salt(
+                                                    "reasoning_level_selector",
+                                                )
+                                                .width(84.0)
                                                 .selected_text(self.reasoning_level.as_ui_label())
                                                 .show_ui(ui, |ui| {
                                                     ui.selectable_value(
@@ -1038,70 +1085,75 @@ impl eframe::App for Messenger95App {
                                                         "Haut",
                                                     );
                                                 });
-                                        });
+                                            });
+                                        } else {
+                                            ui.label("Max tokens:");
+                                            sunken_panel(ui, WIN95_INPUT_BG, 3, |ui| {
+                                                ui.add_sized(
+                                                    [88.0, 20.0],
+                                                    egui::DragValue::new(&mut self.max_tokens)
+                                                        .range(256..=16384)
+                                                        .speed(64),
+                                                );
+                                            });
+                                        }
+                                    });
 
-                                        ui.label("Max tokens:");
-                                        sunken_panel(ui, WIN95_INPUT_BG, 3, |ui| {
-                                            ui.add_sized(
-                                                [110.0, 24.0],
-                                                egui::DragValue::new(&mut self.max_tokens)
-                                                    .range(512..=32768)
-                                                    .speed(128),
-                                            );
-                                        });
+                                    if gpt_oss_selected {
+                                        ui.add_space(2.0);
+                                        ui.horizontal_wrapped(|ui| {
+                                            ui.label("Max:");
+                                            sunken_panel(ui, WIN95_INPUT_BG, 3, |ui| {
+                                                ui.add_sized(
+                                                    [84.0, 20.0],
+                                                    egui::DragValue::new(&mut self.max_tokens)
+                                                        .range(512..=32768)
+                                                        .speed(128),
+                                                );
+                                            });
 
-                                        ui.label("Contexte (num_ctx):");
-                                        sunken_panel(ui, WIN95_INPUT_BG, 3, |ui| {
-                                            ui.add_sized(
-                                                [90.0, 24.0],
-                                                egui::DragValue::new(&mut self.num_ctx)
-                                                    .range(0..=131072)
-                                                    .speed(512),
-                                            );
-                                        });
-                                        ui.label(RichText::new("0=auto").small());
+                                            ui.label("Ctx:");
+                                            sunken_panel(ui, WIN95_INPUT_BG, 3, |ui| {
+                                                ui.add_sized(
+                                                    [72.0, 20.0],
+                                                    egui::DragValue::new(&mut self.num_ctx)
+                                                        .range(0..=131072)
+                                                        .speed(512),
+                                                );
+                                            });
+                                            ui.label(RichText::new("0=auto").small());
 
-                                        ui.label("Repeat penalty:");
-                                        sunken_panel(ui, WIN95_INPUT_BG, 3, |ui| {
-                                            ui.add_sized(
-                                                [82.0, 24.0],
-                                                egui::DragValue::new(&mut self.repeat_penalty)
-                                                    .range(1.05..=1.60)
-                                                    .speed(0.01),
-                                            );
-                                        });
+                                            ui.label("Penalty:");
+                                            sunken_panel(ui, WIN95_INPUT_BG, 3, |ui| {
+                                                ui.add_sized(
+                                                    [66.0, 20.0],
+                                                    egui::DragValue::new(&mut self.repeat_penalty)
+                                                        .range(1.05..=1.60)
+                                                        .speed(0.01),
+                                                );
+                                            });
 
-                                        ui.label("repeat_last_n:");
-                                        sunken_panel(ui, WIN95_INPUT_BG, 3, |ui| {
-                                            ui.add_sized(
-                                                [82.0, 24.0],
-                                                egui::DragValue::new(&mut self.repeat_last_n)
-                                                    .range(0..=4096)
-                                                    .speed(64),
-                                            );
-                                        });
+                                            ui.label("Last_n:");
+                                            sunken_panel(ui, WIN95_INPUT_BG, 3, |ui| {
+                                                ui.add_sized(
+                                                    [66.0, 20.0],
+                                                    egui::DragValue::new(&mut self.repeat_last_n)
+                                                        .range(0..=4096)
+                                                        .speed(64),
+                                                );
+                                            });
 
-                                        ui.checkbox(&mut self.use_streaming, "Streaming");
-                                    } else {
-                                        ui.add_space(8.0);
-                                        ui.label("Max tokens:");
-                                        sunken_panel(ui, WIN95_INPUT_BG, 3, |ui| {
-                                            ui.add_sized(
-                                                [100.0, 24.0],
-                                                egui::DragValue::new(&mut self.max_tokens)
-                                                    .range(256..=16384)
-                                                    .speed(64),
-                                            );
+                                            ui.checkbox(&mut self.use_streaming, "Streaming");
                                         });
                                     }
                                 },
                             );
 
                             ui.allocate_ui_with_layout(
-                                egui::vec2(LOGO_COLUMN_WIDTH, HEADER_ROW_HEIGHT),
+                                egui::vec2(header_layout.logo_col_width, header_layout.row_height),
                                 Layout::right_to_left(Align::Center),
                                 |ui| {
-                                    render_logo(ui);
+                                    render_logo(ui, header_layout.logo_size);
                                 },
                             );
                         });
@@ -1525,20 +1577,32 @@ mod tests {
     }
 
     #[test]
-    fn logo_display_size_is_at_least_two_times_previous_size() {
-        const PREVIOUS_LOGO_DISPLAY_SIZE: f32 = 110.0;
+    fn header_layout_stays_compact_and_within_available_width() {
+        let layout_gpt = compute_header_layout(620.0, true);
+        let layout_qwen = compute_header_layout(620.0, false);
+
         assert!(
-            LOGO_DISPLAY_SIZE >= PREVIOUS_LOGO_DISPLAY_SIZE * 2.0,
-            "logo display size {} should be at least 2x {}px",
-            LOGO_DISPLAY_SIZE,
-            PREVIOUS_LOGO_DISPLAY_SIZE
+            layout_gpt.controls_col_width + layout_gpt.logo_col_width + 6.0 <= 621.0,
+            "header width overflow in gpt mode"
+        );
+        assert!(
+            layout_qwen.controls_col_width + layout_qwen.logo_col_width + 6.0 <= 621.0,
+            "header width overflow in qwen mode"
+        );
+        assert!(
+            layout_gpt.row_height > layout_qwen.row_height,
+            "gpt mode should reserve more height for extra controls"
+        );
+        assert!(
+            layout_gpt.row_height <= 140.0,
+            "gpt controls should stay compact"
         );
     }
 
     #[test]
     fn logo_png_is_high_resolution_for_display_size() {
         let (width, height) = parse_png_dimensions(include_bytes!("../images/logo1.png"));
-        let min_required = (LOGO_DISPLAY_SIZE * LOGO_HIGH_RES_MIN_SCALE) as u32;
+        let min_required = (LOGO_SIZE_MAX * LOGO_HIGH_RES_MIN_SCALE) as u32;
         assert_eq!(
             width, height,
             "logo should stay square for predictable rendering"
@@ -1556,15 +1620,16 @@ mod tests {
     #[test]
     fn logo_renders_large_and_right_aligned() {
         let ctx = egui::Context::default();
+        let layout = compute_header_layout(920.0, true);
         let mut logo_rect = None;
         let mut column_rect = None;
 
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 let response = ui.allocate_ui_with_layout(
-                    egui::vec2(LOGO_COLUMN_WIDTH, HEADER_ROW_HEIGHT),
+                    egui::vec2(layout.logo_col_width, layout.row_height),
                     Layout::right_to_left(Align::Center),
-                    |ui| render_logo(ui).rect,
+                    |ui| render_logo(ui, layout.logo_size).rect,
                 );
                 column_rect = Some(response.response.rect);
                 logo_rect = Some(response.inner);
@@ -1575,16 +1640,16 @@ mod tests {
         let column_rect = column_rect.expect("logo column should be rendered");
 
         assert!(
-            (logo_rect.width() - LOGO_DISPLAY_SIZE).abs() <= 1.0,
+            (logo_rect.width() - layout.logo_size).abs() <= 1.0,
             "logo width {} should be close to {}",
             logo_rect.width(),
-            LOGO_DISPLAY_SIZE
+            layout.logo_size
         );
         assert!(
-            (logo_rect.height() - LOGO_DISPLAY_SIZE).abs() <= 1.0,
+            (logo_rect.height() - layout.logo_size).abs() <= 1.0,
             "logo height {} should be close to {}",
             logo_rect.height(),
-            LOGO_DISPLAY_SIZE
+            layout.logo_size
         );
         assert!(
             logo_rect.right() >= column_rect.right() - 2.0,
