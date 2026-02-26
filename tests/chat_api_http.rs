@@ -88,3 +88,37 @@ async fn stream_uses_num_predict_from_config() {
 
     mock.assert();
 }
+
+#[tokio::test]
+async fn stream_sends_anti_repeat_and_keep_alive_options() {
+    let server = MockServer::start();
+
+    let mock = server.mock(|when, then| {
+        when.method(POST)
+            .path("/api/chat")
+            .body_contains("\"repeat_penalty\":1.25")
+            .body_contains("\"repeat_last_n\":256")
+            .body_contains("\"num_ctx\":16384")
+            .body_contains("\"keep_alive\":\"5m\"")
+            .body_contains("\"stop\":[\"<END>\"]");
+        then.status(200)
+            .header("content-type", "application/x-ndjson")
+            .body("{\"done\":true}\n");
+    });
+
+    let config = ChatConfig {
+        host: server.base_url(),
+        max_tokens: 777,
+        num_ctx: Some(16384),
+        repeat_penalty: Some(1.25),
+        repeat_last_n: Some(256),
+        keep_alive: Some("5m".to_string()),
+        stop: vec!["<END>".to_string()],
+        ..ChatConfig::default()
+    };
+    let client = ChatClient::new(config).unwrap();
+
+    client.stream("Test", |_chunk| {}).await.unwrap();
+
+    mock.assert();
+}

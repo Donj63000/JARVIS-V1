@@ -23,6 +23,9 @@ const WIN95_WINDOW_BG: Color32 = Color32::from_rgb(236, 233, 216);
 const WIN95_INPUT_BG: Color32 = Color32::from_rgb(255, 255, 255);
 const USER_BUBBLE: Color32 = Color32::from_rgb(235, 244, 255);
 const ASSISTANT_BUBBLE: Color32 = Color32::from_rgb(255, 255, 228);
+const LOGO_COLUMN_WIDTH: f32 = 260.0;
+const HEADER_ROW_HEIGHT: f32 = 240.0;
+const LOGO_DISPLAY_SIZE: f32 = 220.0;
 
 #[derive(Clone, Copy)]
 enum ChatRole {
@@ -69,41 +72,6 @@ impl ReasoningLevel {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TokenBudgetLevel {
-    Low,
-    Medium,
-    High,
-}
-
-impl TokenBudgetLevel {
-    fn as_ui_label(self) -> &'static str {
-        match self {
-            Self::Low => "Bas",
-            Self::Medium => "Moyen",
-            Self::High => "Haut",
-        }
-    }
-
-    fn tokens(self) -> u32 {
-        match self {
-            Self::Low => 2048,
-            Self::Medium => 4096,
-            Self::High => 8192,
-        }
-    }
-
-    fn from_tokens(tokens: u32) -> Self {
-        if tokens >= 6144 {
-            Self::High
-        } else if tokens >= 3072 {
-            Self::Medium
-        } else {
-            Self::Low
-        }
-    }
-}
-
 pub fn run_gui(config: ChatConfig) -> Result<()> {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -118,6 +86,7 @@ pub fn run_gui(config: ChatConfig) -> Result<()> {
         native_options,
         Box::new(move |cc| {
             configure_theme(&cc.egui_ctx);
+            egui_extras::install_image_loaders(&cc.egui_ctx);
             Ok(Box::new(Messenger95App::new(config.clone())))
         }),
     )
@@ -282,6 +251,14 @@ fn sunken_panel<R>(
     panel
 }
 
+fn render_logo(ui: &mut egui::Ui) -> egui::Response {
+    ui.add(
+        egui::Image::new(egui::include_image!("../images/logo1.png"))
+            .fit_to_exact_size(egui::vec2(LOGO_DISPLAY_SIZE, LOGO_DISPLAY_SIZE))
+            .texture_options(egui::TextureOptions::LINEAR),
+    )
+}
+
 fn is_connection_refused_error(err: &str) -> bool {
     let lower = err.to_ascii_lowercase();
     lower.contains("os error 10061")
@@ -300,16 +277,26 @@ fn format_worker_error(err: &str, host: &str) -> String {
     format!("Erreur: {err}")
 }
 
+fn format_anyhow_chain(err: &anyhow::Error) -> String {
+    let mut out = err.to_string();
+    for (index, cause) in err.chain().skip(1).enumerate() {
+        out.push_str(&format!("\n  cause {}: {}", index + 1, cause));
+    }
+    out
+}
+
 pub struct Messenger95App {
     host: String,
     model: String,
     reasoning_level: ReasoningLevel,
-    token_budget_level: TokenBudgetLevel,
     system: String,
     system_grounded: String,
     temperature: f32,
     max_tokens: u32,
     num_ctx: u32,
+    repeat_penalty: f32,
+    repeat_last_n: i32,
+    use_streaming: bool,
     timeout_seconds: u64,
     use_factory_data: bool,
     input: String,
@@ -360,12 +347,14 @@ impl Messenger95App {
             host: config.host,
             model,
             reasoning_level: ReasoningLevel::Medium,
-            token_budget_level: TokenBudgetLevel::from_tokens(config.max_tokens),
             system: config.system,
             system_grounded,
             temperature: config.temperature,
             max_tokens: config.max_tokens,
             num_ctx: config.num_ctx.unwrap_or(0),
+            repeat_penalty: config.repeat_penalty.unwrap_or(1.20),
+            repeat_last_n: config.repeat_last_n.unwrap_or(256),
+            use_streaming: true,
             timeout_seconds: config.timeout_seconds,
             use_factory_data: false,
             input: String::new(),
@@ -389,30 +378,37 @@ impl Messenger95App {
         self.model == GPT_OSS_MODEL
     }
 
-    fn gpt_oss_recommended_ctx_for_tokens(tokens: u32) -> u32 {
-        if tokens <= 2048 {
-            8192
-        } else if tokens <= 4096 {
-            16384
-        } else {
-            32768
+    fn gpt_oss_min_predict(level: ReasoningLevel) -> u32 {
+        match level {
+            ReasoningLevel::Low => 2048,
+            ReasoningLevel::Medium => 4096,
+            ReasoningLevel::High => 8192,
         }
     }
 
-    fn compute_generation_budget(&self) -> (u32, Option<u32>) {
+    fn gpt_oss_min_ctx(level: ReasoningLevel) -> u32 {
+        match level {
+            ReasoningLevel::Low => 8192,
+            ReasoningLevel::Medium => 16384,
+            ReasoningLevel::High => 32768,
+        }
+    }
+
+    fn compute_budget(&self) -> (u32, Option<u32>) {
         if !self.is_gpt_oss_selected() {
             return (self.max_tokens, None);
         }
 
-        let mut num_predict = self.max_tokens;
-        num_predict = num_predict.clamp(512, 16384);
+        let min_predict = Self::gpt_oss_min_predict(self.reasoning_level);
+        let num_predict = self.max_tokens.max(min_predict).clamp(512, 32768);
 
-        let min_ctx = Self::gpt_oss_recommended_ctx_for_tokens(num_predict);
+        let min_ctx = Self::gpt_oss_min_ctx(self.reasoning_level);
         let mut num_ctx = if self.num_ctx == 0 {
             min_ctx
         } else {
             self.num_ctx
         };
+        num_ctx = num_ctx.max(min_ctx);
         num_ctx = num_ctx.max(num_predict.saturating_add(1024));
 
         (num_predict, Some(num_ctx))
@@ -494,25 +490,45 @@ impl Messenger95App {
             include_in_context: true,
         });
         self.pending_assistant_index = Some(self.messages.len() - 1);
-        let (effective_max_tokens, effective_num_ctx) = self.compute_generation_budget();
-        let reasoning_effort = if gpt_oss_mode {
-            Some(self.reasoning_level.as_api_value().to_string())
-        } else {
-            None
-        };
+        let (num_predict, num_ctx_opt) = self.compute_budget();
 
         let config = ChatConfig {
             host: self.host.clone(),
             model: self.model.clone(),
             system: system_prompt,
             temperature: self.temperature,
-            max_tokens: effective_max_tokens,
-            timeout_seconds: self.timeout_seconds,
-            reasoning_effort,
-            num_ctx: effective_num_ctx,
+            max_tokens: num_predict,
+            timeout_seconds: if gpt_oss_mode && self.reasoning_level == ReasoningLevel::High {
+                self.timeout_seconds.max(1800)
+            } else {
+                self.timeout_seconds
+            },
+            reasoning_effort: if gpt_oss_mode {
+                Some(self.reasoning_level.as_api_value().to_string())
+            } else {
+                None
+            },
+            num_ctx: num_ctx_opt,
+            repeat_penalty: if gpt_oss_mode {
+                Some(self.repeat_penalty)
+            } else {
+                None
+            },
+            repeat_last_n: if gpt_oss_mode {
+                Some(self.repeat_last_n)
+            } else {
+                None
+            },
+            top_k: None,
+            top_p: None,
+            min_p: None,
+            seed: None,
+            stop: Vec::new(),
+            keep_alive: Some("5m".to_string()),
             ..ChatConfig::default()
         };
 
+        let use_streaming = self.use_streaming;
         let (tx, rx) = mpsc::channel::<WorkerEvent>();
         self.worker_rx = Some(rx);
 
@@ -523,44 +539,49 @@ impl Messenger95App {
 
             let result = match runtime {
                 Ok(rt) => rt.block_on(async {
-                    let base_config = config.clone();
-                    let client = ChatClient::new(config)?;
                     let history = messages_for_request;
+                    let client = ChatClient::new(config.clone())?;
                     let mut streamed_any_content = false;
-                    let mut streamed_any_thinking = false;
+                    let mut stream_error: Option<anyhow::Error> = None;
 
-                    let stream_result = client
-                        .stream_with_messages_detailed(history.clone(), |delta: AssistantDelta| {
-                            if !delta.thinking.is_empty() {
-                                streamed_any_thinking = true;
-                                let _ = tx.send(WorkerEvent::Thinking(delta.thinking));
-                            }
-                            if !delta.content.is_empty() {
-                                streamed_any_content = true;
-                                let _ = tx.send(WorkerEvent::Chunk(delta.content));
-                            }
-                        })
-                        .await;
+                    if use_streaming {
+                        let stream_result = client
+                            .stream_with_messages_detailed(
+                                history.clone(),
+                                |delta: AssistantDelta| {
+                                    if !delta.thinking.is_empty() {
+                                        let _ = tx.send(WorkerEvent::Thinking(delta.thinking));
+                                    }
+                                    if !delta.content.is_empty() {
+                                        streamed_any_content = true;
+                                        let _ = tx.send(WorkerEvent::Chunk(delta.content));
+                                    }
+                                },
+                            )
+                            .await;
 
-                    let mut recovery_reason: Option<String> = None;
-                    if let Err(stream_error) = stream_result {
-                        recovery_reason = Some(format!(
-                            "Streaming indisponible, fallback impossible: {stream_error}"
-                        ));
-                    } else if !streamed_any_content {
-                        recovery_reason = Some(
-                            "Streaming termine sans reponse textuelle, relance en mode non-streaming."
-                                .to_string(),
-                        );
+                        if let Err(err) = stream_result {
+                            stream_error = Some(err);
+                        }
                     }
 
-                    if recovery_reason.is_some() {
-                        let response = client
+                    if stream_error.is_some() || !streamed_any_content {
+                        let mut safe = config.clone();
+                        if safe.reasoning_effort.as_deref() == Some("high") {
+                            safe.reasoning_effort = Some("medium".to_string());
+                        }
+                        safe.repeat_penalty = Some(safe.repeat_penalty.unwrap_or(1.1).max(1.25));
+                        safe.repeat_last_n = Some(safe.repeat_last_n.unwrap_or(64).max(256));
+                        safe.max_tokens = safe.max_tokens.max(4096);
+                        safe.num_ctx = Some(safe.num_ctx.unwrap_or(16384).max(16384));
+
+                        let safe_client = ChatClient::new(safe)?;
+                        let response = safe_client
                             .oneshot_ollama_with_messages(history.clone())
                             .await
-                            .with_context(|| recovery_reason.unwrap_or_default())?;
+                            .context("Fallback oneshot echoue")?;
+
                         if !response.thinking.is_empty() {
-                            streamed_any_thinking = true;
                             let _ = tx.send(WorkerEvent::Thinking(response.thinking));
                         }
                         if !response.content.is_empty() {
@@ -569,57 +590,39 @@ impl Messenger95App {
                         }
                     }
 
-                    if !streamed_any_content && streamed_any_thinking {
-                        let mut final_config = base_config.clone();
-                        final_config.reasoning_effort = Some("low".to_string());
-                        final_config.max_tokens = final_config.max_tokens.max(4096);
-                        final_config.num_ctx = Some(final_config.num_ctx.unwrap_or(16384).max(16384));
+                    if gpt_oss_mode && !streamed_any_content {
+                        let mut final_cfg = config.clone();
+                        final_cfg.reasoning_effort = Some("low".to_string());
+                        final_cfg.max_tokens = 2048.max(final_cfg.max_tokens.min(4096));
+                        final_cfg.num_ctx = Some(final_cfg.num_ctx.unwrap_or(16384).max(16384));
+                        final_cfg.repeat_penalty =
+                            Some(final_cfg.repeat_penalty.unwrap_or(1.1).max(1.25));
+                        final_cfg.repeat_last_n =
+                            Some(final_cfg.repeat_last_n.unwrap_or(64).max(256));
 
                         let mut final_messages = history.clone();
                         final_messages.push(Message {
                             role: "user".to_string(),
-                            content: "Donne maintenant la REPONSE FINALE (pas la chaine de pensee). \
-Reponds en francais, de maniere longue et structuree (titres + listes), \
-avec exemples concrets et code si pertinent. \
-Ne mentionne pas que c'est une seconde passe."
-                                .to_string(),
+                            content: "Donne maintenant UNIQUEMENT la reponse finale (pas la chaine de pensee). Reponds en francais, long, structure (titres + listes), avec exemples concrets.".to_string(),
                         });
 
-                        match ChatClient::new(final_config) {
-                            Ok(final_client) => {
-                                match final_client
-                                    .oneshot_ollama_with_messages(final_messages)
-                                    .await
-                                {
-                                    Ok(final_resp) => {
-                                        if !final_resp.content.trim().is_empty() {
-                                            let _ = tx.send(WorkerEvent::Chunk(final_resp.content));
-                                            streamed_any_content = true;
-                                        } else {
-                                            let _ = tx.send(WorkerEvent::Chunk(
-                                                "Le modele n'a toujours pas produit de reponse finale. Affichage de la chaine de pensee par defaut."
-                                                    .to_string(),
-                                            ));
-                                            streamed_any_content = true;
-                                        }
-                                    }
-                                    Err(err) => {
-                                        let _ = tx.send(WorkerEvent::Error(format!(
-                                            "Finalizer pass echoue: {err}"
-                                        )));
-                                    }
-                                }
-                            }
-                            Err(err) => {
-                                let _ = tx.send(WorkerEvent::Error(format!(
-                                    "Impossible de creer final_client: {err}"
-                                )));
-                            }
+                        let final_client = ChatClient::new(final_cfg)?;
+                        let final_resp = final_client
+                            .oneshot_ollama_with_messages(final_messages)
+                            .await
+                            .context("Finalizer pass echoue")?;
+
+                        if !final_resp.content.trim().is_empty() {
+                            let _ = tx.send(WorkerEvent::Chunk(final_resp.content));
+                            streamed_any_content = true;
                         }
                     }
 
-                    if !streamed_any_content && !streamed_any_thinking {
-                        let _ = tx.send(WorkerEvent::Chunk("<reponse vide>".to_string()));
+                    if !streamed_any_content {
+                        let _ = tx.send(WorkerEvent::Chunk(
+                            "Le modele n'a pas produit de reponse finale. Essaie think=medium et/ou augmente repeat_penalty."
+                                .to_string(),
+                        ));
                     }
 
                     Ok::<(), anyhow::Error>(())
@@ -632,7 +635,7 @@ Ne mentionne pas que c'est une seconde passe."
                     let _ = tx.send(WorkerEvent::Done);
                 }
                 Err(err) => {
-                    let _ = tx.send(WorkerEvent::Error(err.to_string()));
+                    let _ = tx.send(WorkerEvent::Error(format_anyhow_chain(&err)));
                 }
             }
         });
@@ -664,14 +667,35 @@ Ne mentionne pas que c'est une seconde passe."
                     } else {
                         "Erreur".to_string()
                     };
+
+                    if let Some(index) = self.pending_assistant_index {
+                        if let Some(line) = self.messages.get_mut(index) {
+                            if line.text.trim().is_empty() {
+                                line.text = format_worker_error(&err, &self.host);
+                            } else {
+                                line.text.push_str("\n\n");
+                                line.text.push_str(&format_worker_error(&err, &self.host));
+                            }
+                            line.include_in_context = false;
+                        } else {
+                            self.messages.push(ChatLine {
+                                role: ChatRole::Assistant,
+                                text: format_worker_error(&err, &self.host),
+                                thinking: String::new(),
+                                include_in_context: false,
+                            });
+                        }
+                    } else {
+                        self.messages.push(ChatLine {
+                            role: ChatRole::Assistant,
+                            text: format_worker_error(&err, &self.host),
+                            thinking: String::new(),
+                            include_in_context: false,
+                        });
+                    }
+
                     self.pending_assistant_index = None;
                     self.worker_rx = None;
-                    self.messages.push(ChatLine {
-                        role: ChatRole::Assistant,
-                        text: format_worker_error(&err, &self.host),
-                        thinking: String::new(),
-                        include_in_context: false,
-                    });
                     break;
                 }
                 Err(TryRecvError::Empty) => break,
@@ -829,12 +853,6 @@ impl eframe::App for Messenger95App {
                                         .color(WIN95_HIGHLIGHT),
                                 );
                                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                    ui.add(
-                                        egui::Image::new(egui::include_image!("../images/logo1.png"))
-                                            .fit_to_exact_size(egui::vec2(34.0, 34.0))
-                                            .texture_options(egui::TextureOptions::LINEAR),
-                                    );
-                                    ui.add_space(6.0);
                                     ui.label(
                                         RichText::new(format!("Statut: {}", self.status))
                                             .small()
@@ -960,109 +978,141 @@ impl eframe::App for Messenger95App {
                 raised_panel(ui, WIN95_FACE, 8, |ui| {
                     sunken_panel(ui, WIN95_FACE, 6, |ui| {
                         ui.horizontal(|ui| {
-                            let host_width = if self.is_gpt_oss_selected() {
-                                170.0
-                            } else {
-                                220.0
-                            };
+                            let controls_col_width =
+                                (ui.available_width() - LOGO_COLUMN_WIDTH - 2.0).max(260.0);
 
-                            ui.label("Host:");
-                            sunken_panel(ui, WIN95_INPUT_BG, 3, |ui| {
-                                ui.add_sized(
-                                    [host_width, 24.0],
-                                    egui::TextEdit::singleline(&mut self.host),
-                                );
-                            });
-                            ui.label("Modele:");
-                            sunken_panel(ui, WIN95_INPUT_BG, 3, |ui| {
-                                egui::ComboBox::from_id_salt("model_selector")
-                                    .width(140.0)
-                                    .selected_text(self.model.as_str())
-                                    .show_ui(ui, |ui| {
-                                        for option in MODEL_OPTIONS {
-                                            ui.selectable_value(
-                                                &mut self.model,
-                                                option.to_string(),
-                                                option,
-                                            );
-                                        }
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(controls_col_width, HEADER_ROW_HEIGHT),
+                                Layout::left_to_right(Align::Center),
+                                |ui| {
+                                    let host_width = if self.is_gpt_oss_selected() {
+                                        126.0
+                                    } else {
+                                        170.0
+                                    };
+
+                                    ui.label("Host:");
+                                    sunken_panel(ui, WIN95_INPUT_BG, 3, |ui| {
+                                        ui.add_sized(
+                                            [host_width, 24.0],
+                                            egui::TextEdit::singleline(&mut self.host),
+                                        );
                                     });
-                            });
+                                    ui.label("Modele:");
+                                    sunken_panel(ui, WIN95_INPUT_BG, 3, |ui| {
+                                        egui::ComboBox::from_id_salt("model_selector")
+                                            .width(140.0)
+                                            .selected_text(self.model.as_str())
+                                            .show_ui(ui, |ui| {
+                                                for option in MODEL_OPTIONS {
+                                                    ui.selectable_value(
+                                                        &mut self.model,
+                                                        option.to_string(),
+                                                        option,
+                                                    );
+                                                }
+                                            });
+                                    });
 
-                            if self.is_gpt_oss_selected() {
-                                ui.add_space(6.0);
-                                ui.label(RichText::new("Raisonnement:").strong());
-                                sunken_panel(ui, WIN95_INPUT_BG, 3, |ui| {
-                                    egui::ComboBox::from_id_salt("reasoning_level_selector")
-                                        .width(92.0)
-                                        .selected_text(self.reasoning_level.as_ui_label())
-                                        .show_ui(ui, |ui| {
-                                            ui.selectable_value(
-                                                &mut self.reasoning_level,
-                                                ReasoningLevel::Low,
-                                                "Bas",
-                                            );
-                                            ui.selectable_value(
-                                                &mut self.reasoning_level,
-                                                ReasoningLevel::Medium,
-                                                "Moyen",
-                                            );
-                                            ui.selectable_value(
-                                                &mut self.reasoning_level,
-                                                ReasoningLevel::High,
-                                                "Haut",
+                                    if self.is_gpt_oss_selected() {
+                                        ui.add_space(4.0);
+                                        ui.label(RichText::new("Raisonnement:").strong());
+                                        sunken_panel(ui, WIN95_INPUT_BG, 3, |ui| {
+                                            egui::ComboBox::from_id_salt("reasoning_level_selector")
+                                                .width(92.0)
+                                                .selected_text(self.reasoning_level.as_ui_label())
+                                                .show_ui(ui, |ui| {
+                                                    ui.selectable_value(
+                                                        &mut self.reasoning_level,
+                                                        ReasoningLevel::Low,
+                                                        "Bas",
+                                                    );
+                                                    ui.selectable_value(
+                                                        &mut self.reasoning_level,
+                                                        ReasoningLevel::Medium,
+                                                        "Moyen",
+                                                    );
+                                                    ui.selectable_value(
+                                                        &mut self.reasoning_level,
+                                                        ReasoningLevel::High,
+                                                        "Haut",
+                                                    );
+                                                });
+                                        });
+
+                                        ui.label("Max tokens:");
+                                        sunken_panel(ui, WIN95_INPUT_BG, 3, |ui| {
+                                            ui.add_sized(
+                                                [110.0, 24.0],
+                                                egui::DragValue::new(&mut self.max_tokens)
+                                                    .range(512..=32768)
+                                                    .speed(128),
                                             );
                                         });
-                                });
 
-                                ui.label("Budget tokens:");
-                                sunken_panel(ui, WIN95_INPUT_BG, 3, |ui| {
-                                    egui::ComboBox::from_id_salt("token_budget_selector")
-                                        .width(118.0)
-                                        .selected_text(self.token_budget_level.as_ui_label())
-                                        .show_ui(ui, |ui| {
-                                            ui.selectable_value(
-                                                &mut self.token_budget_level,
-                                                TokenBudgetLevel::Low,
-                                                "Bas (2048)",
-                                            );
-                                            ui.selectable_value(
-                                                &mut self.token_budget_level,
-                                                TokenBudgetLevel::Medium,
-                                                "Moyen (4096)",
-                                            );
-                                            ui.selectable_value(
-                                                &mut self.token_budget_level,
-                                                TokenBudgetLevel::High,
-                                                "Haut (8192)",
+                                        ui.label("Contexte (num_ctx):");
+                                        sunken_panel(ui, WIN95_INPUT_BG, 3, |ui| {
+                                            ui.add_sized(
+                                                [90.0, 24.0],
+                                                egui::DragValue::new(&mut self.num_ctx)
+                                                    .range(0..=131072)
+                                                    .speed(512),
                                             );
                                         });
-                                });
-                                self.max_tokens = self.token_budget_level.tokens();
+                                        ui.label(RichText::new("0=auto").small());
 
-                                ui.label("Contexte (num_ctx):");
-                                sunken_panel(ui, WIN95_INPUT_BG, 3, |ui| {
-                                    ui.add_sized(
-                                        [90.0, 24.0],
-                                        egui::DragValue::new(&mut self.num_ctx)
-                                            .range(0..=131072)
-                                            .speed(256),
-                                    );
-                                });
-                                ui.label(RichText::new("auto=0").small());
-                            } else {
-                                ui.add_space(8.0);
-                                ui.label("Max tokens:");
-                                sunken_panel(ui, WIN95_INPUT_BG, 3, |ui| {
-                                    ui.add_sized(
-                                        [100.0, 24.0],
-                                        egui::DragValue::new(&mut self.max_tokens)
-                                            .range(256..=16384)
-                                            .speed(64),
-                                    );
-                                });
-                            }
+                                        ui.label("Repeat penalty:");
+                                        sunken_panel(ui, WIN95_INPUT_BG, 3, |ui| {
+                                            ui.add_sized(
+                                                [82.0, 24.0],
+                                                egui::DragValue::new(&mut self.repeat_penalty)
+                                                    .range(1.05..=1.60)
+                                                    .speed(0.01),
+                                            );
+                                        });
+
+                                        ui.label("repeat_last_n:");
+                                        sunken_panel(ui, WIN95_INPUT_BG, 3, |ui| {
+                                            ui.add_sized(
+                                                [82.0, 24.0],
+                                                egui::DragValue::new(&mut self.repeat_last_n)
+                                                    .range(0..=4096)
+                                                    .speed(64),
+                                            );
+                                        });
+
+                                        ui.checkbox(&mut self.use_streaming, "Streaming");
+                                    } else {
+                                        ui.add_space(8.0);
+                                        ui.label("Max tokens:");
+                                        sunken_panel(ui, WIN95_INPUT_BG, 3, |ui| {
+                                            ui.add_sized(
+                                                [100.0, 24.0],
+                                                egui::DragValue::new(&mut self.max_tokens)
+                                                    .range(256..=16384)
+                                                    .speed(64),
+                                            );
+                                        });
+                                    }
+                                },
+                            );
+
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(LOGO_COLUMN_WIDTH, HEADER_ROW_HEIGHT),
+                                Layout::right_to_left(Align::Center),
+                                |ui| {
+                                    render_logo(ui);
+                                },
+                            );
                         });
+                        if self.is_gpt_oss_selected() {
+                            ui.label(
+                                RichText::new(
+                                    "Conseil: think=high peut boucler. Augmente repeat_penalty (>=1.2) ou passe en moyen.",
+                                )
+                                .small(),
+                            );
+                        }
                         ui.horizontal(|ui| {
                             let has_factory_docs = self.guide_kb.is_some();
                             let changed = ui
@@ -1232,18 +1282,21 @@ impl eframe::App for Messenger95App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    const LOGO_HIGH_RES_MIN_SCALE: f32 = 3.0;
 
     fn test_app_with_messages(messages: Vec<ChatLine>) -> Messenger95App {
         Messenger95App {
             host: "http://localhost:11434".to_string(),
             model: "qwen2.5-coder:14b".to_string(),
             reasoning_level: ReasoningLevel::Medium,
-            token_budget_level: TokenBudgetLevel::Medium,
             system: "system".to_string(),
             system_grounded: "system-grounded".to_string(),
             temperature: 0.2,
             max_tokens: 1024,
             num_ctx: 0,
+            repeat_penalty: 1.20,
+            repeat_last_n: 256,
+            use_streaming: true,
             timeout_seconds: 600,
             use_factory_data: false,
             input: String::new(),
@@ -1277,6 +1330,32 @@ mod tests {
         rendered_rect.expect("message should be rendered")
     }
 
+    fn parse_png_dimensions(bytes: &[u8]) -> (u32, u32) {
+        const PNG_SIGNATURE: [u8; 8] = [137, 80, 78, 71, 13, 10, 26, 10];
+        assert!(
+            bytes.len() >= 24,
+            "png should contain signature + IHDR dimensions"
+        );
+        assert_eq!(
+            &bytes[0..8],
+            PNG_SIGNATURE.as_slice(),
+            "unexpected png signature"
+        );
+        assert_eq!(&bytes[12..16], b"IHDR", "first png chunk must be IHDR");
+
+        let width = u32::from_be_bytes(
+            bytes[16..20]
+                .try_into()
+                .expect("png width should be encoded on 4 bytes"),
+        );
+        let height = u32::from_be_bytes(
+            bytes[20..24]
+                .try_into()
+                .expect("png height should be encoded on 4 bytes"),
+        );
+        (width, height)
+    }
+
     #[test]
     fn model_options_include_qwen_coder_14b() {
         assert_eq!(MODEL_OPTIONS.len(), 2);
@@ -1291,6 +1370,8 @@ mod tests {
             temperature: 0.45,
             max_tokens: 1536,
             num_ctx: Some(4096),
+            repeat_penalty: Some(1.28),
+            repeat_last_n: Some(384),
             timeout_seconds: 321,
             ..ChatConfig::default()
         };
@@ -1300,11 +1381,13 @@ mod tests {
         assert_eq!(app.temperature, 0.45);
         assert_eq!(app.max_tokens, 1536);
         assert_eq!(app.num_ctx, 4096);
+        assert_eq!(app.repeat_penalty, 1.28);
+        assert_eq!(app.repeat_last_n, 384);
         assert_eq!(app.timeout_seconds, 321);
     }
 
     #[test]
-    fn compute_generation_budget_for_qwen_keeps_max_tokens_and_auto_ctx() {
+    fn compute_budget_for_qwen_keeps_max_tokens_and_auto_ctx() {
         let app = Messenger95App::new(ChatConfig {
             model: "qwen2.5-coder:14b".to_string(),
             max_tokens: 1337,
@@ -1312,13 +1395,13 @@ mod tests {
             ..ChatConfig::default()
         });
 
-        let (predict, ctx) = app.compute_generation_budget();
+        let (predict, ctx) = app.compute_budget();
         assert_eq!(predict, 1337);
         assert_eq!(ctx, None);
     }
 
     #[test]
-    fn compute_generation_budget_for_gpt_oss_uses_selected_token_budget() {
+    fn compute_budget_for_gpt_oss_enforces_minimums_from_reasoning_level() {
         let mut app = Messenger95App::new(ChatConfig {
             model: GPT_OSS_MODEL.to_string(),
             max_tokens: 1024,
@@ -1326,16 +1409,14 @@ mod tests {
             ..ChatConfig::default()
         });
         app.reasoning_level = ReasoningLevel::High;
-        app.token_budget_level = TokenBudgetLevel::Medium;
-        app.max_tokens = app.token_budget_level.tokens();
 
-        let (predict, ctx) = app.compute_generation_budget();
-        assert_eq!(predict, 4096);
-        assert_eq!(ctx, Some(16384));
+        let (predict, ctx) = app.compute_budget();
+        assert_eq!(predict, 8192);
+        assert_eq!(ctx, Some(32768));
     }
 
     #[test]
-    fn compute_generation_budget_for_gpt_oss_respects_ctx_override_with_headroom() {
+    fn compute_budget_for_gpt_oss_respects_ctx_override_with_headroom() {
         let mut app = Messenger95App::new(ChatConfig {
             model: GPT_OSS_MODEL.to_string(),
             max_tokens: 5000,
@@ -1344,9 +1425,9 @@ mod tests {
         });
         app.reasoning_level = ReasoningLevel::Medium;
 
-        let (predict, ctx) = app.compute_generation_budget();
+        let (predict, ctx) = app.compute_budget();
         assert_eq!(predict, 5000);
-        assert_eq!(ctx, Some(6024));
+        assert_eq!(ctx, Some(16384));
     }
 
     #[test]
@@ -1441,6 +1522,76 @@ mod tests {
         ]);
 
         assert_eq!(app.current_thinking_text(), "Trace 2");
+    }
+
+    #[test]
+    fn logo_display_size_is_at_least_two_times_previous_size() {
+        const PREVIOUS_LOGO_DISPLAY_SIZE: f32 = 110.0;
+        assert!(
+            LOGO_DISPLAY_SIZE >= PREVIOUS_LOGO_DISPLAY_SIZE * 2.0,
+            "logo display size {} should be at least 2x {}px",
+            LOGO_DISPLAY_SIZE,
+            PREVIOUS_LOGO_DISPLAY_SIZE
+        );
+    }
+
+    #[test]
+    fn logo_png_is_high_resolution_for_display_size() {
+        let (width, height) = parse_png_dimensions(include_bytes!("../images/logo1.png"));
+        let min_required = (LOGO_DISPLAY_SIZE * LOGO_HIGH_RES_MIN_SCALE) as u32;
+        assert_eq!(
+            width, height,
+            "logo should stay square for predictable rendering"
+        );
+        assert!(
+            width >= min_required && height >= min_required,
+            "logo source {}x{} should be at least {}x{}",
+            width,
+            height,
+            min_required,
+            min_required
+        );
+    }
+
+    #[test]
+    fn logo_renders_large_and_right_aligned() {
+        let ctx = egui::Context::default();
+        let mut logo_rect = None;
+        let mut column_rect = None;
+
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let response = ui.allocate_ui_with_layout(
+                    egui::vec2(LOGO_COLUMN_WIDTH, HEADER_ROW_HEIGHT),
+                    Layout::right_to_left(Align::Center),
+                    |ui| render_logo(ui).rect,
+                );
+                column_rect = Some(response.response.rect);
+                logo_rect = Some(response.inner);
+            });
+        });
+
+        let logo_rect = logo_rect.expect("logo should be rendered");
+        let column_rect = column_rect.expect("logo column should be rendered");
+
+        assert!(
+            (logo_rect.width() - LOGO_DISPLAY_SIZE).abs() <= 1.0,
+            "logo width {} should be close to {}",
+            logo_rect.width(),
+            LOGO_DISPLAY_SIZE
+        );
+        assert!(
+            (logo_rect.height() - LOGO_DISPLAY_SIZE).abs() <= 1.0,
+            "logo height {} should be close to {}",
+            logo_rect.height(),
+            LOGO_DISPLAY_SIZE
+        );
+        assert!(
+            logo_rect.right() >= column_rect.right() - 2.0,
+            "logo should be right-aligned (logo right={}, column right={})",
+            logo_rect.right(),
+            column_rect.right()
+        );
     }
 
     #[test]

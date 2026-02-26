@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use futures_util::StreamExt;
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
+use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -14,6 +14,14 @@ pub struct ChatConfig {
     pub timeout_seconds: u64,
     pub reasoning_effort: Option<String>,
     pub num_ctx: Option<u32>,
+    pub repeat_penalty: Option<f32>,
+    pub repeat_last_n: Option<i32>,
+    pub top_k: Option<i32>,
+    pub top_p: Option<f32>,
+    pub min_p: Option<f32>,
+    pub seed: Option<i32>,
+    pub stop: Vec<String>,
+    pub keep_alive: Option<String>,
 }
 
 impl Default for ChatConfig {
@@ -27,6 +35,14 @@ impl Default for ChatConfig {
             timeout_seconds: 600,
             reasoning_effort: None,
             num_ctx: None,
+            repeat_penalty: None,
+            repeat_last_n: None,
+            top_k: None,
+            top_p: None,
+            min_p: None,
+            seed: None,
+            stop: Vec::new(),
+            keep_alive: None,
         }
     }
 }
@@ -112,10 +128,18 @@ impl ChatClient {
             messages,
             stream: false,
             think: self.config.reasoning_effort.clone(),
+            keep_alive: self.config.keep_alive.clone(),
             options: OllamaChatOptions {
                 num_predict: self.config.max_tokens,
                 temperature: self.config.temperature,
                 num_ctx: self.config.num_ctx,
+                repeat_penalty: self.config.repeat_penalty,
+                repeat_last_n: self.config.repeat_last_n,
+                top_k: self.config.top_k,
+                top_p: self.config.top_p,
+                min_p: self.config.min_p,
+                seed: self.config.seed,
+                stop: self.config.stop.clone(),
             },
         };
 
@@ -183,10 +207,18 @@ impl ChatClient {
             messages,
             stream: true,
             think: self.config.reasoning_effort.clone(),
+            keep_alive: self.config.keep_alive.clone(),
             options: OllamaChatOptions {
                 num_predict: self.config.max_tokens,
                 temperature: self.config.temperature,
                 num_ctx: self.config.num_ctx,
+                repeat_penalty: self.config.repeat_penalty,
+                repeat_last_n: self.config.repeat_last_n,
+                top_k: self.config.top_k,
+                top_p: self.config.top_p,
+                min_p: self.config.min_p,
+                seed: self.config.seed,
+                stop: self.config.stop.clone(),
             },
         };
 
@@ -194,6 +226,7 @@ impl ChatClient {
             .client
             .post(self.url("/api/chat"))
             .header(CONTENT_TYPE, "application/json")
+            .header(ACCEPT, "application/x-ndjson")
             .json(&req)
             .send()
             .await
@@ -300,6 +333,8 @@ struct OllamaChatRequest {
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     think: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    keep_alive: Option<String>,
     options: OllamaChatOptions,
 }
 
@@ -309,6 +344,20 @@ struct OllamaChatOptions {
     temperature: f32,
     #[serde(skip_serializing_if = "Option::is_none")]
     num_ctx: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repeat_penalty: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repeat_last_n: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_k: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_p: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    min_p: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    seed: Option<i32>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    stop: Vec<String>,
 }
 
 #[derive(Deserialize, Debug, Default)]
