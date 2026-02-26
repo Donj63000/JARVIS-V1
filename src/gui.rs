@@ -59,6 +59,49 @@ impl ReasoningLevel {
             Self::High => "high",
         }
     }
+
+    fn as_ui_label(self) -> &'static str {
+        match self {
+            Self::Low => "Bas",
+            Self::Medium => "Moyen",
+            Self::High => "Haut",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TokenBudgetLevel {
+    Low,
+    Medium,
+    High,
+}
+
+impl TokenBudgetLevel {
+    fn as_ui_label(self) -> &'static str {
+        match self {
+            Self::Low => "Bas",
+            Self::Medium => "Moyen",
+            Self::High => "Haut",
+        }
+    }
+
+    fn tokens(self) -> u32 {
+        match self {
+            Self::Low => 2048,
+            Self::Medium => 4096,
+            Self::High => 8192,
+        }
+    }
+
+    fn from_tokens(tokens: u32) -> Self {
+        if tokens >= 6144 {
+            Self::High
+        } else if tokens >= 3072 {
+            Self::Medium
+        } else {
+            Self::Low
+        }
+    }
 }
 
 pub fn run_gui(config: ChatConfig) -> Result<()> {
@@ -261,6 +304,7 @@ pub struct Messenger95App {
     host: String,
     model: String,
     reasoning_level: ReasoningLevel,
+    token_budget_level: TokenBudgetLevel,
     system: String,
     system_grounded: String,
     temperature: f32,
@@ -316,6 +360,7 @@ impl Messenger95App {
             host: config.host,
             model,
             reasoning_level: ReasoningLevel::Medium,
+            token_budget_level: TokenBudgetLevel::from_tokens(config.max_tokens),
             system: config.system,
             system_grounded,
             temperature: config.temperature,
@@ -344,19 +389,13 @@ impl Messenger95App {
         self.model == GPT_OSS_MODEL
     }
 
-    fn gpt_oss_min_predict_for_level(level: ReasoningLevel) -> u32 {
-        match level {
-            ReasoningLevel::Low => 2048,
-            ReasoningLevel::Medium => 4096,
-            ReasoningLevel::High => 8192,
-        }
-    }
-
-    fn gpt_oss_min_ctx_for_level(level: ReasoningLevel) -> u32 {
-        match level {
-            ReasoningLevel::Low => 8192,
-            ReasoningLevel::Medium => 16384,
-            ReasoningLevel::High => 32768,
+    fn gpt_oss_recommended_ctx_for_tokens(tokens: u32) -> u32 {
+        if tokens <= 2048 {
+            8192
+        } else if tokens <= 4096 {
+            16384
+        } else {
+            32768
         }
     }
 
@@ -365,11 +404,10 @@ impl Messenger95App {
             return (self.max_tokens, None);
         }
 
-        let min_predict = Self::gpt_oss_min_predict_for_level(self.reasoning_level);
-        let mut num_predict = self.max_tokens.max(min_predict);
+        let mut num_predict = self.max_tokens;
         num_predict = num_predict.clamp(512, 16384);
 
-        let min_ctx = Self::gpt_oss_min_ctx_for_level(self.reasoning_level);
+        let min_ctx = Self::gpt_oss_recommended_ctx_for_tokens(num_predict);
         let mut num_ctx = if self.num_ctx == 0 {
             min_ctx
         } else {
@@ -791,6 +829,12 @@ impl eframe::App for Messenger95App {
                                         .color(WIN95_HIGHLIGHT),
                                 );
                                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    ui.add(
+                                        egui::Image::new(egui::include_image!("../images/logo1.png"))
+                                            .fit_to_exact_size(egui::vec2(34.0, 34.0))
+                                            .texture_options(egui::TextureOptions::LINEAR),
+                                    );
+                                    ui.add_space(6.0);
                                     ui.label(
                                         RichText::new(format!("Statut: {}", self.status))
                                             .small()
@@ -916,16 +960,23 @@ impl eframe::App for Messenger95App {
                 raised_panel(ui, WIN95_FACE, 8, |ui| {
                     sunken_panel(ui, WIN95_FACE, 6, |ui| {
                         ui.horizontal(|ui| {
+                            let host_width = if self.is_gpt_oss_selected() {
+                                170.0
+                            } else {
+                                220.0
+                            };
+
                             ui.label("Host:");
                             sunken_panel(ui, WIN95_INPUT_BG, 3, |ui| {
                                 ui.add_sized(
-                                    [220.0, 24.0],
+                                    [host_width, 24.0],
                                     egui::TextEdit::singleline(&mut self.host),
                                 );
                             });
                             ui.label("Modele:");
                             sunken_panel(ui, WIN95_INPUT_BG, 3, |ui| {
                                 egui::ComboBox::from_id_salt("model_selector")
+                                    .width(140.0)
                                     .selected_text(self.model.as_str())
                                     .show_ui(ui, |ui| {
                                         for option in MODEL_OPTIONS {
@@ -937,51 +988,81 @@ impl eframe::App for Messenger95App {
                                         }
                                     });
                             });
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("Max tokens:");
-                            sunken_panel(ui, WIN95_INPUT_BG, 3, |ui| {
-                                ui.add_sized(
-                                    [100.0, 24.0],
-                                    egui::DragValue::new(&mut self.max_tokens)
-                                        .range(256..=16384)
-                                        .speed(64),
-                                );
-                            });
 
-                            ui.add_space(10.0);
-
-                            ui.label("Contexte (num_ctx):");
-                            sunken_panel(ui, WIN95_INPUT_BG, 3, |ui| {
-                                ui.add_sized(
-                                    [110.0, 24.0],
-                                    egui::DragValue::new(&mut self.num_ctx)
-                                        .range(0..=131072)
-                                        .speed(256),
-                                );
-                            });
-                            ui.label(RichText::new("(0 = auto)").small());
-                        });
-                        if self.is_gpt_oss_selected() {
-                            ui.horizontal(|ui| {
+                            if self.is_gpt_oss_selected() {
+                                ui.add_space(6.0);
                                 ui.label(RichText::new("Raisonnement:").strong());
-                                ui.selectable_value(
-                                    &mut self.reasoning_level,
-                                    ReasoningLevel::Low,
-                                    "Bas",
-                                );
-                                ui.selectable_value(
-                                    &mut self.reasoning_level,
-                                    ReasoningLevel::Medium,
-                                    "Moyen",
-                                );
-                                ui.selectable_value(
-                                    &mut self.reasoning_level,
-                                    ReasoningLevel::High,
-                                    "Haut",
-                                );
-                            });
-                        }
+                                sunken_panel(ui, WIN95_INPUT_BG, 3, |ui| {
+                                    egui::ComboBox::from_id_salt("reasoning_level_selector")
+                                        .width(92.0)
+                                        .selected_text(self.reasoning_level.as_ui_label())
+                                        .show_ui(ui, |ui| {
+                                            ui.selectable_value(
+                                                &mut self.reasoning_level,
+                                                ReasoningLevel::Low,
+                                                "Bas",
+                                            );
+                                            ui.selectable_value(
+                                                &mut self.reasoning_level,
+                                                ReasoningLevel::Medium,
+                                                "Moyen",
+                                            );
+                                            ui.selectable_value(
+                                                &mut self.reasoning_level,
+                                                ReasoningLevel::High,
+                                                "Haut",
+                                            );
+                                        });
+                                });
+
+                                ui.label("Budget tokens:");
+                                sunken_panel(ui, WIN95_INPUT_BG, 3, |ui| {
+                                    egui::ComboBox::from_id_salt("token_budget_selector")
+                                        .width(118.0)
+                                        .selected_text(self.token_budget_level.as_ui_label())
+                                        .show_ui(ui, |ui| {
+                                            ui.selectable_value(
+                                                &mut self.token_budget_level,
+                                                TokenBudgetLevel::Low,
+                                                "Bas (2048)",
+                                            );
+                                            ui.selectable_value(
+                                                &mut self.token_budget_level,
+                                                TokenBudgetLevel::Medium,
+                                                "Moyen (4096)",
+                                            );
+                                            ui.selectable_value(
+                                                &mut self.token_budget_level,
+                                                TokenBudgetLevel::High,
+                                                "Haut (8192)",
+                                            );
+                                        });
+                                });
+                                self.max_tokens = self.token_budget_level.tokens();
+
+                                ui.label("Contexte (num_ctx):");
+                                sunken_panel(ui, WIN95_INPUT_BG, 3, |ui| {
+                                    ui.add_sized(
+                                        [90.0, 24.0],
+                                        egui::DragValue::new(&mut self.num_ctx)
+                                            .range(0..=131072)
+                                            .speed(256),
+                                    );
+                                });
+                                ui.label(RichText::new("auto=0").small());
+                            } else {
+                                ui.add_space(8.0);
+                                ui.label("Max tokens:");
+                                sunken_panel(ui, WIN95_INPUT_BG, 3, |ui| {
+                                    ui.add_sized(
+                                        [100.0, 24.0],
+                                        egui::DragValue::new(&mut self.max_tokens)
+                                            .range(256..=16384)
+                                            .speed(64),
+                                    );
+                                });
+                            }
+                        });
                         ui.horizontal(|ui| {
                             let has_factory_docs = self.guide_kb.is_some();
                             let changed = ui
@@ -1157,6 +1238,7 @@ mod tests {
             host: "http://localhost:11434".to_string(),
             model: "qwen2.5-coder:14b".to_string(),
             reasoning_level: ReasoningLevel::Medium,
+            token_budget_level: TokenBudgetLevel::Medium,
             system: "system".to_string(),
             system_grounded: "system-grounded".to_string(),
             temperature: 0.2,
@@ -1236,7 +1318,7 @@ mod tests {
     }
 
     #[test]
-    fn compute_generation_budget_for_gpt_oss_enforces_reasoning_minimums() {
+    fn compute_generation_budget_for_gpt_oss_uses_selected_token_budget() {
         let mut app = Messenger95App::new(ChatConfig {
             model: GPT_OSS_MODEL.to_string(),
             max_tokens: 1024,
@@ -1244,10 +1326,12 @@ mod tests {
             ..ChatConfig::default()
         });
         app.reasoning_level = ReasoningLevel::High;
+        app.token_budget_level = TokenBudgetLevel::Medium;
+        app.max_tokens = app.token_budget_level.tokens();
 
         let (predict, ctx) = app.compute_generation_budget();
-        assert_eq!(predict, 8192);
-        assert_eq!(ctx, Some(32768));
+        assert_eq!(predict, 4096);
+        assert_eq!(ctx, Some(16384));
     }
 
     #[test]
